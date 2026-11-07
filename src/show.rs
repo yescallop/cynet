@@ -1,5 +1,4 @@
-//! `cynet show`: the daemon's status, as text, over a Unix socket. All that a client can ask for is
-//! the verbose form, so the socket can't change anything.
+//! `cynet show`: read-only status over a Unix socket or a Windows named pipe.
 //!
 //! The text has the colors of `wg show`. Only the client knows whether it writes to a terminal, so
 //! the daemon always includes them, and the client removes them otherwise, as `wg` does.
@@ -11,7 +10,6 @@ use std::{
     fmt::Write as _,
     fs,
     io::{self, ErrorKind, IsTerminal},
-    os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     sync::Arc,
     time::Duration,
@@ -22,9 +20,14 @@ use gotatun::{
     device::{Device, DeviceTransports, configure::PeerStats},
     x25519::PublicKey,
 };
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+#[cfg(windows)]
+use tokio::net::windows::named_pipe::{ClientOptions, ServerOptions};
+#[cfg(unix)]
+use tokio::net::{UnixListener, UnixStream};
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
-    net::{UnixListener, UnixStream},
+    io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
     sync::mpsc,
     task::JoinHandle,
     time::{Instant, timeout},
@@ -40,12 +43,15 @@ use crate::{
 };
 
 /// The directory of the sockets, one per interface.
+#[cfg(unix)]
 const SOCKET_DIR: &str = "/run/cynet";
+#[cfg(windows)]
+const SOCKET_DIR: &str = r"\\.\pipe\";
 
 /// How long to wait for a daemon to reply, and for a client to ask.
 const REPLY_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// What a client sends to ask for the verbose status. It asks for the plain one by sending nothing.
+/// What a client sends for verbose status. Plain status uses EOF on Unix or a newline on Windows.
 const VERBOSE_REQUEST: &[u8] = b"verbose\n";
 
 const RESET: &str = "\x1b[0m";
@@ -58,7 +64,14 @@ const MAGENTA: &str = "\x1b[35m";
 const CYAN: &str = "\x1b[36m";
 
 fn socket_path(name: &str) -> PathBuf {
-    Path::new(SOCKET_DIR).join(format!("{name}.sock"))
+    #[cfg(unix)]
+    {
+        Path::new(SOCKET_DIR).join(format!("{name}.sock"))
+    }
+    #[cfg(windows)]
+    {
+        Path::new(SOCKET_DIR).join(format!("cynet-{name}.sock"))
+    }
 }
 
 /// Returns the first few characters of a public key, enough to tell peers apart.
@@ -366,12 +379,14 @@ pub fn strip_colors(text: &str) -> String {
 
 /// Serves a node's status for as long as it lives.
 pub struct ShowServer {
+    #[cfg(unix)]
     path: PathBuf,
     task: JoinHandle<()>,
 }
 
 impl ShowServer {
-    /// Starts serving on the interface's socket, replacing any left behind by a crash.
+    /// Starts serving on the interface's local status endpoint.
+    #[cfg(unix)]
     pub fn start<T: DeviceTransports>(name: &str, status: Status<T>) -> eyre::Result<Self> {
         fs::create_dir_all(SOCKET_DIR)
             .wrap_err_with(|| format!("failed to create {SOCKET_DIR}"))?;
@@ -402,26 +417,89 @@ impl ShowServer {
 
         Ok(Self { path, task })
     }
+
+    /// Starts a local-only Windows named pipe, refusing another server for the same interface.
+    #[cfg(windows)]
+    pub fn start<T: DeviceTransports>(name: &str, status: Status<T>) -> eyre::Result<Self> {
+        let path = socket_path(name);
+        let mut server = ServerOptions::new()
+            .first_pipe_instance(true)
+            .reject_remote_clients(true)
+            .create(&path)
+            .wrap_err_with(|| format!("failed to create {}", path.display()))?;
+        let name = name.to_owned();
+        let task = tokio::spawn(async move {
+            loop {
+                if let Err(error) = server.connect().await {
+                    tracing::warn!("status pipe connection failed: {error}");
+                    break;
+                }
+                // Keep a listening instance alive while the connected client reads its reply.
+                let next = match ServerOptions::new()
+                    .reject_remote_clients(true)
+                    .create(&path)
+                {
+                    Ok(next) => next,
+                    Err(error) => {
+                        tracing::warn!("failed to create the next status pipe: {error}");
+                        break;
+                    }
+                };
+                let exchange = async {
+                    let verbose = read_request(&mut server).await;
+                    let text = match status.text(&name, verbose).await {
+                        Ok(text) => text,
+                        Err(error) => format!("error: {error:#}\n"),
+                    };
+                    // Named pipes have no half-close: frame the reply and await acknowledgement
+                    // before closing so Windows cannot discard data the client hasn't read yet.
+                    let size = u32::try_from(text.len()).map_err(io::Error::other)?;
+                    server.write_u32_le(size).await?;
+                    server.write_all(text.as_bytes()).await?;
+                    server.read_u8().await?;
+                    Ok::<_, io::Error>(())
+                };
+                let _ = timeout(REPLY_TIMEOUT, exchange).await;
+                server = next;
+            }
+        });
+        Ok(Self { task })
+    }
 }
 
 impl Drop for ShowServer {
     fn drop(&mut self) {
         self.task.abort();
+        #[cfg(unix)]
         let _ = fs::remove_file(&self.path);
     }
 }
 
 /// Reads whether a client asks for the verbose status. One that says anything else, or nothing for
 /// too long, gets the plain one.
-async fn read_request(stream: &mut UnixStream) -> bool {
-    let mut request = Vec::new();
-    let mut stream = stream.take(VERBOSE_REQUEST.len() as u64);
-    let read = stream.read_to_end(&mut request);
+async fn read_request(stream: &mut (impl AsyncRead + Unpin)) -> bool {
+    let mut request = Vec::with_capacity(VERBOSE_REQUEST.len());
+    let read = async {
+        while request.len() < VERBOSE_REQUEST.len() {
+            match stream.read_u8().await {
+                Ok(byte) => {
+                    request.push(byte);
+                    if byte == b'\n' {
+                        break;
+                    }
+                }
+                Err(error) if error.kind() == ErrorKind::UnexpectedEof => break,
+                Err(error) => return Err(error),
+            }
+        }
+        Ok::<_, io::Error>(())
+    };
     matches!(timeout(REPLY_TIMEOUT, read).await, Ok(Ok(_))) && request == VERBOSE_REQUEST
 }
 
 /// Reads one daemon's status, or returns `None` if it is not running: nothing is listening on a
 /// socket that a crash left behind, and a socket can be gone by the time it is read.
+#[cfg(unix)]
 async fn read_status(path: &Path, verbose: bool) -> eyre::Result<Option<String>> {
     let exchange = async {
         let mut stream = match UnixStream::connect(path).await {
@@ -452,6 +530,44 @@ async fn read_status(path: &Path, verbose: bool) -> eyre::Result<Option<String>>
         .wrap_err_with(|| format!("failed to read {}", path.display()))
 }
 
+#[cfg(windows)]
+async fn read_status(path: &Path, verbose: bool) -> eyre::Result<Option<String>> {
+    use windows_sys::Win32::Foundation::ERROR_PIPE_BUSY;
+    let exchange = async {
+        let mut stream = loop {
+            match ClientOptions::new().open(path) {
+                Ok(stream) => break stream,
+                Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+                Err(error) if error.raw_os_error() == Some(ERROR_PIPE_BUSY as i32) => {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                Err(error) => return Err(error),
+            }
+        };
+        stream
+            .write_all(if verbose { VERBOSE_REQUEST } else { b"\n" })
+            .await?;
+        let size = stream.read_u32_le().await?;
+        let mut text = String::new();
+        let read = (&mut stream)
+            .take(u64::from(size))
+            .read_to_string(&mut text)
+            .await?;
+        if read != size as usize {
+            return Err(io::Error::new(
+                ErrorKind::UnexpectedEof,
+                "incomplete status reply",
+            ));
+        }
+        stream.write_u8(0).await?;
+        Ok(Some(text))
+    };
+    timeout(REPLY_TIMEOUT, exchange)
+        .await
+        .wrap_err_with(|| format!("timed out reading {}", path.display()))?
+        .wrap_err_with(|| format!("failed to read {}", path.display()))
+}
+
 /// Returns the sockets of the running daemons, in order of name.
 fn socket_paths() -> eyre::Result<Vec<PathBuf>> {
     let entries = match fs::read_dir(SOCKET_DIR) {
@@ -463,7 +579,15 @@ fn socket_paths() -> eyre::Result<Vec<PathBuf>> {
     };
     let mut paths: Vec<_> = (entries.flatten())
         .map(|entry| entry.path())
-        .filter(|path| path.extension().is_some_and(|ext| ext == "sock"))
+        .filter(|path| {
+            let socket = path.extension().is_some_and(|ext| ext == "sock");
+            #[cfg(windows)]
+            let socket = socket
+                && path
+                    .file_name()
+                    .is_some_and(|name| name.to_string_lossy().starts_with("cynet-"));
+            socket
+        })
         .collect();
     paths.sort_unstable();
     Ok(paths)
@@ -472,6 +596,12 @@ fn socket_paths() -> eyre::Result<Vec<PathBuf>> {
 /// Prints the status of the named interface, or of every running one, with `verbose` adding what
 /// Babel bases its choice of routes on.
 pub async fn show(name: Option<&str>, verbose: bool) -> eyre::Result<()> {
+    if let Some(name) = name {
+        eyre::ensure!(
+            crate::config::valid_interface_name(name),
+            "invalid interface name {name:?}"
+        );
+    }
     let paths = match name {
         Some(name) => vec![socket_path(name)],
         None => socket_paths()?,
