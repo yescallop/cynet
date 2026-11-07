@@ -1,14 +1,17 @@
-use std::{fs, os::unix::net, path::PathBuf, time::Duration};
+use std::time::Duration;
+#[cfg(unix)]
+use std::{fs, os::unix::net, path::PathBuf};
 
 use gotatun::x25519::{PublicKey, StaticSecret};
-use tokio::{
-    io::AsyncWriteExt,
-    net::{UnixListener, UnixStream},
-};
+use tokio::io::AsyncWriteExt;
+#[cfg(unix)]
+use tokio::net::UnixListener;
 
+#[cfg(unix)]
+use super::read_status;
 use super::{
-    format_age, format_bytes, format_neighbour, format_status, read_request, read_status,
-    short_key, strip_colors,
+    format_age, format_bytes, format_neighbour, format_status, read_request, short_key,
+    strip_colors,
 };
 use crate::{
     babel::{
@@ -283,6 +286,7 @@ fn links_are_shown_with_more_detail_when_verbose() {
 }
 
 /// Returns a path for a socket of this test process, with nothing there.
+#[cfg(unix)]
 fn socket_path(label: &str) -> PathBuf {
     let path = std::env::temp_dir().join(format!("cynet-test-{}-{label}", std::process::id()));
     let _ = fs::remove_file(&path);
@@ -290,6 +294,7 @@ fn socket_path(label: &str) -> PathBuf {
 }
 
 #[tokio::test]
+#[cfg(unix)]
 async fn status_comes_from_a_running_daemon_as_asked_for() {
     for verbose in [false, true] {
         let path = socket_path(&format!("running-{verbose}"));
@@ -318,7 +323,7 @@ async fn other_requests_get_the_plain_status() {
         b"nonsense\n",
         b"verbose\nmore",
     ] {
-        let (mut daemon, mut client) = UnixStream::pair().unwrap();
+        let (mut daemon, mut client) = tokio::io::duplex(64);
         client.write_all(request).await.unwrap();
         client.shutdown().await.unwrap();
 
@@ -330,12 +335,13 @@ async fn other_requests_get_the_plain_status() {
 /// So does a client that keeps quiet without closing its side, such as `socat`, in the end.
 #[tokio::test(start_paused = true)]
 async fn silent_clients_get_the_plain_status() {
-    let (mut daemon, _client) = UnixStream::pair().unwrap();
+    let (mut daemon, _client) = tokio::io::duplex(64);
     assert!(!read_request(&mut daemon).await);
 }
 
 /// A crash leaves the socket behind, with nothing listening on it.
 #[tokio::test]
+#[cfg(unix)]
 async fn socket_left_by_a_crash_means_not_running() {
     let path = socket_path("left");
     drop(net::UnixListener::bind(&path).unwrap());
@@ -348,6 +354,7 @@ async fn socket_left_by_a_crash_means_not_running() {
 }
 
 #[tokio::test]
+#[cfg(unix)]
 async fn missing_socket_means_not_running() {
     let text = read_status(&socket_path("missing"), false).await;
     assert_eq!(text.unwrap(), None);
@@ -355,6 +362,7 @@ async fn missing_socket_means_not_running() {
 
 /// A daemon that is there but doesn't answer is a problem to report, not one to skip.
 #[tokio::test(start_paused = true)]
+#[cfg(unix)]
 async fn silent_daemon_is_an_error() {
     let path = socket_path("silent");
     let listener = UnixListener::bind(&path).unwrap();
@@ -368,6 +376,7 @@ async fn silent_daemon_is_an_error() {
 
 /// So is any other failure to connect.
 #[tokio::test]
+#[cfg(unix)]
 async fn unusable_path_is_an_error() {
     let file = socket_path("file");
     fs::write(&file, "").unwrap();
@@ -376,4 +385,74 @@ async fn unusable_path_is_an_error() {
     fs::remove_file(&file).unwrap();
 
     assert!(format!("{:#}", text.unwrap_err()).contains("failed to read"));
+}
+
+#[cfg(windows)]
+mod windows {
+    use super::*;
+    use crate::show::{read_status, socket_paths};
+    use tokio::io::AsyncReadExt;
+    use tokio::net::windows::named_pipe::ServerOptions;
+
+    fn pipe_path(label: &str) -> std::path::PathBuf {
+        crate::show::socket_path(&format!("test-{}-{label}", std::process::id()))
+    }
+
+    #[tokio::test]
+    async fn named_pipe_status_is_framed_and_acknowledged() {
+        for verbose in [false, true] {
+            let path = pipe_path(&format!("reply-{verbose}"));
+            let mut server = ServerOptions::new()
+                .first_pipe_instance(true)
+                .create(&path)
+                .unwrap();
+            assert!(socket_paths().unwrap().contains(&path));
+            let daemon = tokio::spawn(async move {
+                server.connect().await.unwrap();
+                let requested = read_request(&mut server).await;
+                let text = format!("verbose: {requested}\n");
+                server.write_u32_le(text.len() as u32).await.unwrap();
+                server.write_all(text.as_bytes()).await.unwrap();
+                assert_eq!(server.read_u8().await.unwrap(), 0);
+            });
+            let text = read_status(&path, verbose).await.unwrap().unwrap();
+            daemon.await.unwrap();
+            assert_eq!(text, format!("verbose: {verbose}\n"));
+            assert!(!socket_paths().unwrap().contains(&path));
+            assert!(read_status(&path, false).await.unwrap().is_none());
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn silent_named_pipe_is_an_error() {
+        let path = pipe_path("silent");
+        let _server = ServerOptions::new()
+            .first_pipe_instance(true)
+            .create(&path)
+            .unwrap();
+        let result = read_status(&path, false).await;
+        assert!(format!("{:#}", result.unwrap_err()).contains("timed out"));
+    }
+
+    #[tokio::test]
+    async fn truncated_named_pipe_reply_is_an_error() {
+        let path = pipe_path("truncated");
+        let mut server = ServerOptions::new()
+            .first_pipe_instance(true)
+            .create(&path)
+            .unwrap();
+        let daemon = tokio::spawn(async move {
+            server.connect().await.unwrap();
+            let _ = read_request(&mut server).await;
+            server.write_u32_le(100).await.unwrap();
+            server.write_all(b"short").await.unwrap();
+        });
+        assert!(read_status(&path, false).await.is_err());
+        daemon.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn invalid_interface_names_cannot_select_other_pipes() {
+        assert!(crate::show::show(Some(r"..\another"), false).await.is_err());
+    }
 }

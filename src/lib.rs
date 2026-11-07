@@ -18,3 +18,5 @@ pub mod daemon;
 mod netconf;
 pub mod router;
 pub mod show;
+/// UDP sockets configured for an intermittently reachable mesh.
+pub mod udp;
