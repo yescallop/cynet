@@ -18,6 +18,7 @@ addresses = ["10.42.0.1", "fd42::1"]
 # The WireGuard tunnels, as `wg` would show them.
 [wireguard]
 # This node's private key. Alternatively, private_key_file = "/etc/cynet/key".
+# On Windows, use a TOML literal path: private_key_file = 'C:\Tools\cynet\private.key'.
 private_key = "6Hfl9MO1R1qHVvRbQ1cMUwzIo/ZPyQ2wHyFIuKiXZnE="
 # The UDP port to listen on. Defaults to a random one, which only suits a node that peers
 # reach out from, rather than to.

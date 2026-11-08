@@ -1,14 +1,16 @@
-use std::{
-    fs::{self, Permissions},
-    os::unix::fs::{PermissionsExt, symlink},
-    path::Path,
-    time::Duration,
-};
+use std::{path::Path, time::Duration};
 
 use gotatun::x25519::{PublicKey, StaticSecret};
 use ipnet::IpNet;
 
-use super::{Config, Endpoint, decode_key, encode_key, modes_allow_others, world_accessible};
+#[cfg(unix)]
+use super::modes_allow_others;
+use super::{Config, Endpoint, decode_key, encode_key, world_accessible};
+#[cfg(unix)]
+use std::{
+    fs::{self, Permissions},
+    os::unix::fs::{PermissionsExt, symlink},
+};
 
 /// Returns a private key and its public key, both in base64.
 fn keys(n: u8) -> (String, String) {
@@ -573,6 +575,7 @@ fn errors_do_not_quote_keys() {
 }
 
 #[test]
+#[cfg(unix)]
 fn others_need_permission_on_the_file_and_every_directory_above_it() {
     const OPEN: [u32; 2] = [0o755, 0o755];
 
@@ -595,6 +598,7 @@ fn others_need_permission_on_the_file_and_every_directory_above_it() {
 
 /// These don't depend on where the temporary directory is, as they are private whatever is above.
 #[test]
+#[cfg(unix)]
 fn world_access_is_judged_by_the_real_path() {
     let root = std::env::temp_dir().join(format!("cynet-test-world-{}", std::process::id()));
     let (private, open) = (root.join("private"), root.join("open"));

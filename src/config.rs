@@ -37,13 +37,18 @@ mod tests;
 use std::{
     collections::HashSet,
     fmt::Display,
-    fs, io,
+    fs,
     net::{IpAddr, SocketAddr},
-    os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     str::FromStr,
     time::Duration,
 };
+#[cfg(unix)]
+use std::{io, os::unix::fs::PermissionsExt};
+#[cfg(windows)]
+mod windows;
+#[cfg(windows)]
+use windows::world_accessible;
 
 use base64::{Engine, prelude::BASE64_STANDARD};
 use eyre::{Context, bail, ensure, eyre};
@@ -399,7 +404,7 @@ pub fn encode_key(key: &[u8; 32]) -> String {
 }
 
 /// Checks a name against the rule of `wg-quick`, which also keeps it safe in a file path.
-fn valid_interface_name(name: &str) -> bool {
+pub(crate) fn valid_interface_name(name: &str) -> bool {
     (1..=15).contains(&name.len())
         && name != "."
         && name != ".."
@@ -438,6 +443,7 @@ fn warn_if_world_accessible(path: &Path) {
 
 /// Checks whether users with no special claim on a file can read or write it, going by the
 /// permissions of the file itself and of each directory above where it really is.
+#[cfg(unix)]
 fn world_accessible(path: &Path) -> io::Result<bool> {
     let path = fs::canonicalize(path)?;
     let mode = |path: &Path| Ok::<_, io::Error>(fs::metadata(path)?.permissions().mode());
@@ -450,6 +456,7 @@ fn world_accessible(path: &Path) -> io::Result<bool> {
 
 /// Checks whether modes let others read or write a file: they need that permission on the file,
 /// and search permission on every directory above it.
+#[cfg(unix)]
 fn modes_allow_others(file: u32, directories: &[u32]) -> bool {
     file & 0o006 != 0 && directories.iter().all(|mode| mode & 0o001 != 0)
 }

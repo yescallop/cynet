@@ -16,7 +16,6 @@ ipnet = { version = "2.12.2", features = ["serde"] }
 parking_lot = "0.13.0"
 prefix-trie = "0.10.1"
 rand = "0.10.2"
-rtnetlink = "0.23.0"
 serde = { version = "1.0.229", features = ["derive"] }
 slotmap = "1.1.1"
 strum = { version = "0.28.0", features = ["derive"] }
@@ -25,6 +24,20 @@ toml = "1.1.8"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 zerocopy = "0.8.63"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+rtnetlink = "0.23.0"
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_NetworkManagement_Ndis",
+    "Win32_Networking_WinSock",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+] }
 
 [dev-dependencies]
 tokio = { version = "1.53.1", features = ["test-util"] }

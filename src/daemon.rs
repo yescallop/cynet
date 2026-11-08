@@ -16,7 +16,6 @@ use gotatun::{
 use parking_lot::Mutex;
 use tokio::{
     net::lookup_host,
-    signal::unix::{SignalKind, signal},
     sync::mpsc,
     task::JoinHandle,
     time::{Instant, MissedTickBehavior, interval, timeout},
@@ -33,6 +32,7 @@ use crate::{
     netconf,
     router::{Router, RouterConfig, local_prefixes},
     show::{ShowServer, Status},
+    udp::UdpSocketFactory,
 };
 
 /// The capacity of the channel into the driver. A full route table dump from every neighbour at
@@ -390,11 +390,14 @@ async fn refresh_endpoint<T: DeviceTransports>(
 
 /// Runs the daemon until a signal or a failure.
 pub async fn run(config: Config) -> eyre::Result<()> {
+    let shutdown = shutdown_signal()?;
     let tun = netconf::create_tun(&config)?;
     netconf::set_up(&config).await?;
     let tun = TunDevice::from_tun_device(tun).wrap_err("failed to use the TUN device")?;
 
-    let builder = DeviceBuilder::new().with_default_udp().with_ip(tun);
+    let builder = DeviceBuilder::new()
+        .with_udp(UdpSocketFactory::default())
+        .with_ip(tun);
     let mut node = Node::start(&config, Params::new(), builder).await?;
 
     netconf::warn_if_not_forwarding(&config);
@@ -404,9 +407,6 @@ pub async fn run(config: Config) -> eyre::Result<()> {
         tracing::warn!("`cynet show` won't work: {error:#}");
     }
 
-    let mut interrupt = signal(SignalKind::interrupt()).wrap_err("failed to handle signals")?;
-    let mut terminate = signal(SignalKind::terminate()).wrap_err("failed to handle signals")?;
-
     tracing::info!(
         "{} is up, with router-id {:016x}",
         config.name,
@@ -414,8 +414,7 @@ pub async fn run(config: Config) -> eyre::Result<()> {
     );
 
     let result = tokio::select! {
-        _ = interrupt.recv() => Ok(()),
-        _ = terminate.recv() => Ok(()),
+        _ = shutdown => Ok(()),
         result = node.failed() => result,
     };
 
@@ -424,4 +423,31 @@ pub async fn run(config: Config) -> eyre::Result<()> {
     node.stop().await;
 
     result
+}
+
+/// Installs handlers before starting the node, including Windows console close events.
+fn shutdown_signal() -> eyre::Result<impl Future<Output = ()>> {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        let mut interrupt = signal(SignalKind::interrupt()).wrap_err("failed to handle SIGINT")?;
+        let mut terminate = signal(SignalKind::terminate()).wrap_err("failed to handle SIGTERM")?;
+        Ok(async move {
+            tokio::select! { _ = interrupt.recv() => {}, _ = terminate.recv() => {} }
+        })
+    }
+    #[cfg(windows)]
+    {
+        use tokio::signal::windows::{ctrl_break, ctrl_c, ctrl_close, ctrl_shutdown};
+        let mut interrupt = ctrl_c().wrap_err("failed to handle Ctrl+C")?;
+        let mut terminate = ctrl_break().wrap_err("failed to handle Ctrl+Break")?;
+        let mut close = ctrl_close().wrap_err("failed to handle console close")?;
+        let mut shutdown = ctrl_shutdown().wrap_err("failed to handle Windows shutdown")?;
+        Ok(async move {
+            tokio::select! {
+                _ = interrupt.recv() => {}, _ = terminate.recv() => {},
+                _ = close.recv() => {}, _ = shutdown.recv() => {},
+            }
+        })
+    }
 }

@@ -16,12 +16,12 @@ use cynet::{
     daemon::Node,
     router::link_local_address,
     show::{short_key, strip_colors},
+    udp::UdpSocketFactory,
 };
 use gotatun::{
     device::DeviceBuilder,
     packet::{Ip, Packet, PacketBufPool},
     tun::{IpRecv, IpSend, MtuWatcher},
-    udp::socket::UdpSocketFactory,
     x25519::{PublicKey, StaticSecret},
 };
 use ipnet::IpNet;
@@ -35,6 +35,49 @@ const UDP: u8 = 17;
 const ICMP: u8 = 1;
 const ICMPV6: u8 = 58;
 const DF: u16 = 0x4000;
+
+/// Exercises the public server and the real CLI, without needing a TUN driver or elevation.
+#[cfg(windows)]
+#[tokio::test(flavor = "multi_thread")]
+async fn windows_show_reads_a_live_node_and_releases_the_pipe() {
+    use cynet::show::ShowServer;
+    use std::process::Command;
+
+    let node = TestNode::start(&NodeSpec::new(21, 0, vec!["10.42.0.21"], vec![(22, None)])).await;
+    let name = format!("test{}", std::process::id());
+    let server = ShowServer::start(&name, node.node.status()).unwrap();
+    assert!(ShowServer::start(&name, node.node.status()).is_err());
+    let cli = env!("CARGO_BIN_EXE_cynet");
+
+    let mut command = Command::new(cli);
+    command.args(["show", &name]);
+    let output = command.output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let text = String::from_utf8(output.stdout).unwrap();
+    assert!(text.contains(&format!("interface: {name}")), "{text}");
+    assert!(text.contains("10.42.0.21/32"), "{text}");
+    assert!(text.contains("router-id:"), "{text}");
+    assert!(!text.contains('\x1b'));
+    let output = Command::new(cli).arg("show").output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains(&format!("interface: {name}")));
+
+    drop(server);
+    // Aborting a task closes its pipe when the runtime next polls it.
+    sleep(Duration::from_millis(50)).await;
+    let output = Command::new(cli).args(["show", &name]).output().unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("is not running"));
+    node.node.stop().await;
+}
 
 /// How long anything in these tests may take, which is far longer than it should.
 const PATIENCE: Duration = Duration::from_secs(20);
@@ -177,13 +220,15 @@ impl TestNode {
         let mut params = Params::new();
         params.set_hello_interval(Interval::new(10).unwrap());
 
-        let builder = DeviceBuilder::new().with_default_udp().with_ip_pair(
-            TunTx(device_tx),
-            TunRx {
-                rx: device_rx,
-                mtu: spec.mtu,
-            },
-        );
+        let builder = DeviceBuilder::new()
+            .with_udp(UdpSocketFactory::default())
+            .with_ip_pair(
+                TunTx(device_tx),
+                TunRx {
+                    rx: device_rx,
+                    mtu: spec.mtu,
+                },
+            );
 
         let node = Node::start(&spec.config(), params, builder).await.unwrap();
 
