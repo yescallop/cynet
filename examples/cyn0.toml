@@ -18,7 +18,7 @@ addresses = ["10.42.0.1", "fd42::1"]
 # The WireGuard tunnels, as `wg` would show them.
 [wireguard]
 # This node's private key. Alternatively, private_key_file = "/etc/cynet/key".
-private_key = "6Hfl9MO1R1qHVvRbQ1cMUwzIo/ZPyQ2wHyFIuKiXZnE="
+private_key = "<private key>"
 # The UDP port to listen on. Defaults to a random one, which only suits a node that peers
 # reach out from, rather than to.
 listen_port = 51820
@@ -52,7 +52,7 @@ kernel_routes = true
 [[peer]]
 public_key = "xTIBA5rboUvnH4htodjb6e697QjLERt1NAB4mZqp8Dg="
 # Optional.
-preshared_key = "FpCyhws9cxwWoV4xELtfJvjJN+zQVRPISllRWgeopVE="
+preshared_key = "<preshared key>"
 # Optional. An address, or a hostname, which is looked up again every reresolve_secs. A peer with
 # no endpoint is reached once it has been in touch.
 endpoint = "vpn.example.com:51820"

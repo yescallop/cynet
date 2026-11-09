@@ -638,10 +638,18 @@ fn keys_round_trip() {
     assert!(decode_key(&encode_key(&key)[..8]).is_err());
 }
 
-/// The example in the repository stays valid.
+/// The example in the repository stays valid, once its placeholders are filled in.
 #[test]
 fn example_config_is_valid() {
-    let config = Config::parse(include_str!("../../examples/cyn0.toml"), None).unwrap();
+    let (private, _) = keys(1);
+    let (psk, _) = keys(4);
+    let text = include_str!("../../examples/cyn0.toml")
+        .replace("<private key>", &private)
+        .replace("<preshared key>", &psk);
+
+    let config = Config::parse(&text, None).unwrap();
     assert_eq!(config.name, "cyn0");
+    assert_eq!(config.private_key.to_bytes(), [1; 32]);
     assert_eq!(config.peers.len(), 2);
+    assert_eq!(config.peers[0].preshared_key, Some([4; 32]));
 }
