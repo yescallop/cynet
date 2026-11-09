@@ -40,6 +40,7 @@ use crate::{
         snapshot::{NeighbourSnapshot, PrefixStatus, RouteSnapshot, Snapshot},
     },
     config::encode_key,
+    daemon::PeerNames,
     conflicts::{ConflictLog, Ongoing},
 };
 
@@ -80,6 +81,7 @@ pub struct Status<T: DeviceTransports> {
     pub(crate) inputs: mpsc::Sender<Input<PublicKey>>,
     pub(crate) public_key: PublicKey,
     pub(crate) started: Instant,
+    pub(crate) peer_names: Arc<PeerNames<String, PublicKey>>,
     pub(crate) conflicts: Arc<Mutex<ConflictLog>>,
 }
 
@@ -104,6 +106,7 @@ impl<T: DeviceTransports> Status<T> {
             self.started.elapsed(),
             &peers,
             &snapshot,
+            &self.peer_names,
             &conflicted,
         );
         text.push_str(&format_conflicts(&conflicts, now));
@@ -120,6 +123,7 @@ fn format_status(
     uptime: Duration,
     peers: &[PeerStats],
     snapshot: &Snapshot<PublicKey>,
+    peer_names: &PeerNames<String, PublicKey>,
     conflicted: &HashSet<IpNet>,
 ) -> String {
     let mut out = String::new();
@@ -149,6 +153,9 @@ fn format_status(
             "\n{YELLOW}{BOLD}peer{RESET}: {YELLOW}{}{RESET}",
             encode_key(key.as_bytes())
         );
+        if let Some(name) = peer_names.get_by_value(key) {
+            let _ = writeln!(out, "  {BOLD}name{RESET}: {name}");
+        }
         if let Some(endpoint) = peer.peer.endpoint {
             let _ = writeln!(out, "  {BOLD}endpoint{RESET}: {endpoint}");
         }

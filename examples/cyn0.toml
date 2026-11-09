@@ -50,6 +50,9 @@ kernel_routes = true
 
 # One table per peer. All peers run cynet: each is a Babel neighbour.
 [[peer]]
+# Optional. Name of the peer
+peer_name = "peer1"
+# Public key used to authenticate the peer.
 public_key = "xTIBA5rboUvnH4htodjb6e697QjLERt1NAB4mZqp8Dg="
 # Optional.
 preshared_key = "<preshared key>"

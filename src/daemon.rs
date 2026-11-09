@@ -3,7 +3,9 @@
 #[cfg(test)]
 mod tests;
 
-use std::{net::SocketAddr, sync::Arc, thread, time::Duration};
+use std::{
+    collections::{HashMap}, hash::Hash, net::SocketAddr, sync::Arc, thread, time::Duration,
+};
 
 use eyre::{Context, bail};
 use futures::future::join_all;
@@ -73,6 +75,55 @@ struct HostPeer {
     last_rx_bytes: Option<usize>,
 }
 
+/// BiMap for peer name
+pub struct PeerNames<K, V> {
+    forward: HashMap<K, V>,
+    reverse: HashMap<V, K>,
+}
+
+impl<K, V> PeerNames<K, V>
+where
+    K: Eq + Hash + Clone,
+    V: Eq + Hash + Clone,
+{
+    fn new() -> Self {
+        Self {
+            forward: HashMap::new(),
+            reverse: HashMap::new(),
+        }
+    }
+
+    fn insert(&mut self, key: K, value: V) {
+        self.remove_by_key(&key);
+        self.remove_by_value(&value);
+
+        self.forward.insert(key.clone(), value.clone());
+        self.reverse.insert(value, key);
+    }
+
+    /// Get value by key
+    pub fn get_by_key(&self, key: &K) -> Option<&V> {
+        self.forward.get(key)
+    }
+
+    /// Get key by value
+    pub fn get_by_value(&self, value: &V) -> Option<&K> {
+        self.reverse.get(value)
+    }
+
+    fn remove_by_key(&mut self, key: &K) {
+        if let Some(value) = self.forward.remove(key) {
+            self.reverse.remove(&value);
+        }
+    }
+
+    fn remove_by_value(&mut self, value: &V) {
+        if let Some(key) = self.reverse.remove(value) {
+            self.forward.remove(&key);
+        }
+    }
+}
+
 /// A running node, on some transports.
 pub struct Node<T: DeviceTransports> {
     device: Arc<Device<T>>,
@@ -84,6 +135,7 @@ pub struct Node<T: DeviceTransports> {
     driver: thread::JoinHandle<()>,
     outputs_task: JoinHandle<()>,
     endpoints_task: Option<JoinHandle<()>>,
+    peer_names: Arc<PeerNames<String, PublicKey>>,
 }
 
 impl<Udp, TunTx, TunRx> Node<(Udp, TunTx, TunRx)>
@@ -120,6 +172,7 @@ where
         ));
 
         let mut host_peers = Vec::new();
+        let mut peer_names = PeerNames::new();
         let device_peers = config.peers.iter().map(|peer| {
             let mut device_peer = Peer::new(peer.public_key);
             device_peer.preshared_key = peer.preshared_key;
@@ -132,6 +185,9 @@ where
                     last_rx_bytes: None,
                 }),
                 None => {}
+            }
+            if let Some(peer_name) = &peer.peer_name {
+                peer_names.insert(peer_name.clone(), peer.public_key);
             }
             device_peer
         });
@@ -204,6 +260,7 @@ where
             driver,
             outputs_task,
             endpoints_task,
+            peer_names: Arc::new(peer_names),
         })
     }
 }
@@ -216,6 +273,7 @@ impl<T: DeviceTransports> Node<T> {
             inputs: self.inputs.clone(),
             public_key: self.public_key,
             started: self.started,
+            peer_names: self.peer_names.clone(),
             conflicts: self.conflicts.clone(),
         }
     }

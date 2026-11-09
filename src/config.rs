@@ -22,6 +22,7 @@
 //! public_key = "base64"
 //! preshared_key = "base64"            # optional
 //! endpoint = "vpn.example.com:51820"  # optional
+//! peer_name = "peer1"                 # optional
 //! ```
 //!
 //! A prefix of `mesh` only gets a kernel route if this node has an address or an attached network
@@ -109,6 +110,7 @@ struct RawPeer {
     public_key: String,
     preshared_key: Option<String>,
     endpoint: Option<String>,
+    peer_name: Option<String>,
 }
 
 /// An entry of `addresses` or `attached`, which a `nonexclusive,` prefix marks as nonexclusive.
@@ -168,6 +170,8 @@ pub struct PeerConfig {
     pub preshared_key: Option<[u8; 32]>,
     /// Where it is reached, if known.
     pub endpoint: Option<Endpoint>,
+    /// The name used to identify this peer.
+    pub peer_name: Option<String>,
 }
 
 /// A validated configuration.
@@ -339,11 +343,18 @@ impl Config {
                     .map(parse_endpoint)
                     .transpose()
                     .wrap_err_with(|| format!("invalid endpoint of peer {}", peer.public_key))?;
-
+                let peer_name = peer
+                    .peer_name
+                    .as_deref()
+                    .map(parse_peer_name)
+                    .transpose()
+                    .wrap_err_with(|| format!("invalid name of peer {}", peer.public_key))?;
+                    
                 Ok(PeerConfig {
                     public_key: peer_key,
                     preshared_key,
                     endpoint,
+                    peer_name,
                 })
             })
             .collect::<eyre::Result<_>>()?;
@@ -427,6 +438,14 @@ fn parse_endpoint(endpoint: &str) -> eyre::Result<Endpoint> {
         host: host.to_owned(),
         port,
     })
+}
+
+/// Parses peer name [A-Z][a-z]_-
+fn parse_peer_name(peer_name: &str) -> eyre::Result<String>{
+    ensure!(!peer_name.is_empty() && peer_name.chars().all(|c| {c.is_ascii_alphanumeric() || c == '_' || c == '-'}),
+        "Peer name only support letters, digits, hyphens, and underscores"
+    );
+    Ok(peer_name.to_owned())
 }
 
 /// Warns if others can get at a file that may hold a private key.
