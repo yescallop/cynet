@@ -394,7 +394,14 @@ pub async fn run(config: Config) -> eyre::Result<()> {
     netconf::set_up(&config).await?;
     let tun = TunDevice::from_tun_device(tun).wrap_err("failed to use the TUN device")?;
 
-    let builder = DeviceBuilder::new().with_default_udp().with_ip(tun);
+    let builder = DeviceBuilder::new()
+        .with_default_udp()
+        // 7 MiB socket buffers, as in gotatun-cli. With the kernel's defaults, the receive buffer
+        // overflowed under a single TCP stream. The kernel caps these at `net.core.rmem_max` and
+        // `wmem_max`.
+        .udp_recv_buffer_size(7 * 1024 * 1024)
+        .udp_send_buffer_size(7 * 1024 * 1024)
+        .with_ip(tun);
     let mut node = Node::start(&config, Params::new(), builder).await?;
 
     netconf::warn_if_not_forwarding(&config);
