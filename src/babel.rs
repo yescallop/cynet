@@ -436,12 +436,12 @@ impl PrefixEntry {
 
     /// Returns the sources in the entry for `prefix` (see
     /// [Duplicate addresses](State#duplicate-addresses)): that of each route, with its neighbour,
-    /// and if this node injects the prefix, its own, with `own_router_id` and no route.
+    /// and if this node injects the prefix, its own, with `own_router_id` and no neighbour.
     fn sources(
         &self,
         prefix: IpNet,
         own_router_id: RouterId,
-    ) -> impl Iterator<Item = (Option<(NeighKey, &RouteEntry)>, Source)> {
+    ) -> impl Iterator<Item = (Option<NeighKey>, Source)> {
         let injected = match self.status {
             PrefixStatus::Injected { nonexclusive } => {
                 let source = Source {
@@ -459,7 +459,7 @@ impl PrefixEntry {
                 router_id: route.router_id,
                 nonexclusive: route.nonexclusive,
             };
-            (Some((key, route)), source)
+            (Some(key), source)
         });
         injected.into_iter().chain(routes)
     }
@@ -481,16 +481,6 @@ impl Source {
         let covers = |a: &Source, b: &Source| !a.nonexclusive && a.prefix.contains(&b.prefix);
         self.router_id != other.router_id && (covers(self, other) || covers(other, self))
     }
-}
-
-/// A source that an update conflicts with: the prefix of a route, through `via`, or of a prefix
-/// that this node injects, with no `via`.
-struct Conflicting {
-    prefix: IpNet,
-    via: Option<NeighKey>,
-    /// Whether it keeps the update from being taken in. A route with an infinite metric gives way
-    /// to it instead (see [`State::reject_conflicting_update`]).
-    blocks: bool,
 }
 
 #[derive(Default)]
@@ -525,38 +515,25 @@ impl RouteTable {
         self.prefixes.remove(prefix);
     }
 
-    /// Returns the sources that an update for `update.prefix` from neighbour `from` conflicts
-    /// with: routes and prefixes injected with `own_router_id`, for prefixes that contain the
-    /// update's prefix or that it contains, but for the route through `from` for its prefix,
-    /// which it replaces (see [Duplicate addresses](State#duplicate-addresses)).
+    /// Returns the prefixes whose sources conflict with an update for `update.prefix` from
+    /// neighbour `from`: routes and prefixes injected with `own_router_id`, for prefixes that
+    /// contain the update's prefix or that it contains, but for the route through `from` for its
+    /// prefix, which it replaces (see [Duplicate addresses](State#duplicate-addresses)).
     fn conflicting(
         &self,
         from: NeighKey,
         update: Source,
         own_router_id: RouterId,
-    ) -> Vec<Conflicting> {
+    ) -> Vec<IpNet> {
         let mut found = Vec::new();
         let mut look_at = |prefix: IpNet| {
             let entry = &self.prefix_entries[&prefix];
-            for (route, source) in entry.sources(prefix, own_router_id) {
-                let via = route.map(|(key, _)| key);
+            let conflicts = entry.sources(prefix, own_router_id).any(|(via, source)| {
                 let replaced = prefix == update.prefix && via == Some(from);
-                if replaced || !source.conflicts_with(&update) {
-                    continue;
-                }
-                // A prefix injected here blocks the update, and so does a route with a finite
-                // metric, even if it is unfeasible: a seqno request may still make it feasible,
-                // and another source shouldn't take over meanwhile. The selected route always has
-                // one. A route with an infinite metric goes over a link that has failed, and only
-                // waits to expire. Were it to block, a node that restarted with a new router-id
-                // could wait that long for its routes, and so could another node taking over its
-                // prefixes.
-                let blocks = route.is_none_or(|(_, r)| r.metric.get() != METRIC_INFINITY);
-                found.push(Conflicting {
-                    prefix,
-                    via,
-                    blocks,
-                });
+                !replaced && source.conflicts_with(&update)
+            });
+            if conflicts {
+                found.push(prefix);
             }
         };
 
@@ -573,6 +550,7 @@ impl RouteTable {
                 }
             }
         }
+        found.sort_unstable();
         found
     }
 
@@ -891,10 +869,9 @@ const FAR_HELLO_SEQNO_OFFSET: u16 = 0x8000;
 /// or is the same, and is exclusive. So an exclusive prefix conflicts with the same prefix, and any
 /// prefix inside it, from another router, while a nonexclusive one, such as a default route at each
 /// of several exit nodes, conflicts with nothing inside it. An update conflicts with what a node
-/// has if it conflicts with a route injected by the node, or with a route through a neighbour with
-/// a finite metric, feasible or not, as the selected route has. A route with an infinite metric,
-/// over a link that has failed, doesn't count, and gives way to the update. Nor does the route
-/// through the sender of the update for the same prefix, which the update replaces.
+/// has if it conflicts with a route injected by the node, or with any route through a neighbour,
+/// except the route through the sender of the update for the same prefix, which the update
+/// replaces.
 ///
 /// A conflicting update is rejected. It still removes the route through its sender, which no
 /// longer advertises it, as a retraction would. For each prefix whose sources block it, the node
@@ -921,10 +898,10 @@ const FAR_HELLO_SEQNO_OFFSET: u16 = 0x8000;
 /// own old routes, until the retractions of those have reached every node (see
 /// [Reboots](State#reboots)).
 ///
-/// No two sources in a node's table conflict, as every update that is taken in removes those that
-/// it would conflict with, or is rejected. So an update from a source that the prefix already has
-/// a route from conflicts with nothing, and only the others are checked, which keeps the cost of
-/// the check out of the refreshes that make up nearly all updates.
+/// No two sources in a node's table conflict, as every conflicting update is rejected. So an update
+/// from a source that the prefix already has a route from conflicts with nothing, and only the
+/// others are checked, which keeps the cost of the check out of the refreshes that make up nearly
+/// all updates.
 pub struct State {
     params: Params,
     router_id: RouterId,
@@ -2052,11 +2029,6 @@ impl State {
     /// over each prefix whose source blocks the update. For each but those that it injects, a
     /// Conflict Alert is then sent along the selected route, once the packet's routes have been
     /// selected, towards the prefix's origin.
-    ///
-    /// An update that doesn't conflict removes the routes that it would conflict with, which all
-    /// have an infinite metric then, so that no two sources in the table conflict. Once its link
-    /// was back, such a route would otherwise have a finite metric beside the new one. None of them
-    /// is selected, as no selected route has an infinite metric.
     fn reject_conflicting_update(
         &mut self,
         from: NeighKey,
@@ -2070,29 +2042,13 @@ impl State {
             nonexclusive,
         };
         let conflicting = self.route_table.conflicting(from, update, self.router_id);
-
-        let mut blocking: Vec<_> = (conflicting.iter())
-            .filter(|c| c.blocks)
-            .map(|c| c.prefix)
-            .collect();
-        if blocking.is_empty() {
-            for c in conflicting {
-                let route = self.route_table.remove(&c.prefix, c.via.unwrap()).unwrap();
-                self.timers.remove(route.timer_key);
-                // The update's own entry is about to have its route.
-                if c.prefix != prefix && self.route_table.prefix_entries[&c.prefix].is_empty() {
-                    self.route_table.remove_entry(&c.prefix);
-                }
-            }
+        if conflicting.is_empty() {
             return false;
         }
 
         self.remove_route(prefix, from);
 
-        // A prefix with more than one source blocking the update is reported once.
-        blocking.sort_unstable();
-        blocking.dedup();
-        for blocked in blocking {
+        for blocked in conflicting {
             self.outputs.push_back(Output::ConflictAlert {
                 prefix: blocked,
                 from,

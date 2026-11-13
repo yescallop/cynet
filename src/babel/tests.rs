@@ -4239,8 +4239,9 @@ fn unfeasible_routes_block_conflicting_updates() {
 }
 
 /// Node 0 learns `old` through neighbour 8, whose link then fails, and then `new` from another
-/// router-id through neighbour 9, which would conflict with the route over the failed link.
-fn route_over_a_failed_link_gives_way(old: IpNet, new: IpNet) {
+/// router-id through neighbour 9, which conflicts with the route over the failed link until that
+/// route expires.
+fn route_over_a_failed_link_blocks_until_it_expires(old: IpNet, new: IpNet) {
     let mut net = Net::new(1);
     net.add_neighbour(0, 8);
     net.add_neighbour(0, 9);
@@ -4250,40 +4251,40 @@ fn route_over_a_failed_link_gives_way(old: IpNet, new: IpNet) {
         &mut n8,
         &mut n9,
         20,
-        &[update(old, 42, 1, 100, 0x8000)],
+        &[update(old, 42, 1, 100, 1600)],
         &[],
     );
     assert_eq!(net.fib(0, old), Some(Fib::Via(8)));
 
     // The link to neighbour 8 fails, which makes the metric of the route through it infinite,
-    // and node 0 holds the prefix. The route stays, until it expires.
+    // and node 0 holds the prefix. The route stays until it expires, 56 s after its update, and
+    // blocks conflicting updates meanwhile.
     n8.rxcost = Some(INF);
     n8.send(&mut net, 0, &[]);
     assert_eq!(net.fib(0, old), Some(Fib::Unreachable));
     assert!(has_route(&net, 0, 8, old));
 
-    // The route through neighbour 9 doesn't conflict with it, and takes its place, so that the
-    // old one can't come back beside it with the link.
     let start = net.now;
-    n9.send(&mut net, 0, &[update(new, 43, 1, 100, 0x8000)]);
-    assert_eq!(net.fib(0, new), Some(Fib::Via(9)));
-    assert!(!has_route(&net, 0, 8, old) && has_route(&net, 0, 9, new));
-
-    // Once the link is back, the old router-id conflicts with the new route, and is rejected.
-    n8.rxcost = Some(NOMINAL_COST);
-    n8.send(&mut net, 0, &[update(old, 42, 1, 100, 0x8000)]);
-    assert_eq!(net.fib(0, new), Some(Fib::Via(9)));
-    assert!(!has_route(&net, 0, 8, old));
+    n9.send(&mut net, 0, &[update(new, 43, 1, 100, 1600)]);
+    assert_eq!(net.fib(0, old), Some(Fib::Unreachable));
+    assert!(has_route(&net, 0, 8, old) && !has_route(&net, 0, 9, new));
     assert_eq!(
-        reported(&net, 0, new, start),
-        [(8, ConflictAlertKind::Rejected)]
+        reported(&net, 0, old, start),
+        [(9, ConflictAlertKind::Rejected)]
     );
+
+    // Once the route through neighbour 8 has expired, the route through neighbour 9 no longer
+    // conflicts, and is taken in.
+    exchange(&mut net, &mut n8, &mut n9, 40, &[], &[]);
+    assert!(!has_route(&net, 0, 8, old));
+    n9.send(&mut net, 0, &[update(new, 43, 1, 100, 1600)]);
+    assert_eq!(net.fib(0, new), Some(Fib::Via(9)));
 }
 
 #[test]
-fn routes_over_failed_links_give_way_to_another_router_id() {
+fn routes_over_failed_links_block_another_router_id_until_they_expire() {
     let p = prefix("fd00:9::/64");
-    route_over_a_failed_link_gives_way(p, p);
+    route_over_a_failed_link_blocks_until_it_expires(p, p);
 }
 
 #[test]
@@ -4326,8 +4327,7 @@ fn nonexclusive_origins_are_routed_to_as_before_unless_one_is_exclusive() {
         let routes = |i: usize| &net.nodes[i].route_table.prefix_entries[&p].routes;
         if exclusive {
             // The chain splits into two sides, meeting between nodes k and k + 1, which depend
-            // on which route each node learnt first: one heard over a link not yet up, with an
-            // infinite metric, gives way.
+            // on which route each node learnt first.
             let k = sides.iter().rposition(|&o| o == Some(0)).unwrap();
             assert!(sides[..=k].iter().all(|&o| o == Some(0)), "{sides:?}");
             assert!(sides[k + 1..].iter().all(|&o| o == Some(3)), "{sides:?}");
@@ -4565,7 +4565,10 @@ fn injected_prefixes_keep_out_what_conflicts_with_them() {
 }
 
 #[test]
-fn routes_over_failed_links_give_way_to_a_prefix_containing_them() {
-    // A route gives way to an exclusive prefix containing it, as it does to the same prefix.
-    route_over_a_failed_link_gives_way(prefix("fd00:9:0:5::/64"), prefix("fd00:9::/48"));
+fn routes_over_failed_links_block_a_prefix_containing_them_until_they_expire() {
+    // A route blocks an exclusive prefix containing it, as it does the same prefix.
+    route_over_a_failed_link_blocks_until_it_expires(
+        prefix("fd00:9:0:5::/64"),
+        prefix("fd00:9::/48"),
+    );
 }
